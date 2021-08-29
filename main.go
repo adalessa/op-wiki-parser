@@ -1,183 +1,193 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"html"
+	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"gorm.io/driver/mysql"
-	"gorm.io/gorm"
 )
 
 const (
-	ChapterURL        = "/home/arieldalessandro/dump-wiki-one-piece/chapter_%d"
-	CoverQuery        = "#Cover_Page"
-	ShortSummaryQuery = "#Short_Summary"
-	LongSummaryQuery  = "#Long_Summary"
+	WikiUrl string = "https://onepiece.fandom.com/wiki/Chapter_%d"
+
+	CoverQuery        string = "#Cover_Page"
+	ShortSummaryQuery        = "#Short_Summary"
+	LongSummaryQuery         = "#Long_Summary"
+
+	ChapterURL string = "/home/arieldalessandro/dump-wiki-one-piece/chapter_%d"
+	MangaUrl          = "https://manganelo.com/chapter/tkqu521609849722/chapter_%d"
+
+	APIUrl string = "https://op-api.ad-impeldown.synology.me/api/chapters"
+	// APIUrl string = "http://op-api.test/api/chapters"
 )
+
+func main() {
+	var number uint = 1
+	for number <= 1022 {
+		chapter, err := processChapter(number)
+		if err != nil {
+			fmt.Println(number, err)
+			return
+		}
+		err = pushToApi(*chapter)
+		if err != nil {
+			fmt.Println(number, err)
+			return
+		}
+		number++
+	}
+
+}
+
+func pushToApi(chapter Chapter) error {
+	data, err := json.Marshal(chapter)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, APIUrl, bytes.NewBuffer(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	fmt.Println(resp.Status)
+	io.Copy(os.Stdout, resp.Body)
+
+	return nil
+}
+
+func processChapter(number uint) (*Chapter, error) {
+	resp, err := HttpDownload(fmt.Sprintf(WikiUrl, number))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	doc, err := goquery.NewDocumentFromResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	chapter := Chapter{}
+
+	chapter.Number = number
+
+	generalInfo := doc.Find("#mw-content-text > div > aside")
+	chapter.Title = generalInfo.Find("[data-source=title]").Text()
+
+	releaseDate := generalInfo.Find("[data-source=date2] > div").Text()
+	releaseDate = strings.Trim(releaseDate, "[ref]")
+	relDate, _ := time.Parse("January 2, 2006", releaseDate)
+	chapter.ReleaseDate = relDate
+
+	chapter.Links = []Link{
+		{
+			Name:  "wiki",
+			Value: fmt.Sprintf(WikiUrl, number),
+		},
+		{
+			Name:  "manganelo",
+			Value: fmt.Sprintf(MangaUrl, number),
+		},
+	}
+
+	cover, coverRefs := parseSection(doc, CoverQuery)
+	coverUrl, exists := generalInfo.Find("figure > a").Attr("href")
+	if !exists {
+		return nil, errors.New("Cover image does not exists")
+	}
+	if cover == "" {
+		cover = "Not Available"
+	}
+
+	chapter.Cover.Text = cover
+	chapter.Cover.References = coverRefs
+	chapter.Cover.Image = coverUrl
+
+	shortSummary, shortSummaryRefs := parseSection(doc, ShortSummaryQuery)
+	chapter.ShortSummary.Text = shortSummary
+	chapter.ShortSummary.References = shortSummaryRefs
+
+	summary, summaryRefs := parseSection(doc, LongSummaryQuery)
+	chapter.Summary.Text = summary
+	chapter.Summary.References = summaryRefs
+
+	var refs []Reference
+	doc.Find(".CharTable a").Each(func(i int, s *goquery.Selection) {
+		var ref = new(Reference)
+		ref.Wiki, _ = s.Attr("href")
+		ref.Name = s.Text()
+		refs = append(refs, *ref)
+	})
+
+	chapter.Characters = refs
+
+	return &chapter, nil
+}
+
+func HttpDownload(link string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, link, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/78.0")
+	client := &http.Client{}
+
+	return client.Do(req)
+}
 
 type LocalTag struct {
 	Url   string
 	Alias string
 }
 
-type Chapter struct {
-	gorm.Model
-	Number       uint8
-	Title        string
-	ReleaseDate  time.Time
-	CoverPage    string `grom:"type:text"`
-	CoverURL     string
-	ShortSummary string `grom:"type:text"`
-	LongSummary  string `grom:"type:text"`
-	WikiURL      string
-	MangaURL     string
-	Tags         []Tag `gorm:"many2many:chapter_tags"`
-}
-
-type Tag struct {
-	gorm.Model
-	URL      string
-	Category string
-	Chapters []Chapter `gorm:"many2many:chapter_tags"`
-}
-
-type Alias struct {
-	gorm.Model
-	Name  string
-	TagID uint
-	Tag   Tag
-}
-
-type ChapterTags struct {
-	ChapterID uint   `gorm:"primaryKey;autoIncrement:false"`
-	TagID     uint   `gorm:"primaryKey;autoIncrement:false"`
-	Section   string `gorm:"primaryKey"`
-}
-
-func TestScrape(db *gorm.DB, chapterNumber int) {
-	fmt.Println("Procesando el chapter", chapterNumber)
-	file, err := os.Open(fmt.Sprintf(ChapterURL, chapterNumber))
-	if err != nil {
-		log.Fatal(err)
-	}
-	doc, err := goquery.NewDocumentFromReader(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	var chapterModel = new(Chapter)
-
-	cover, coverTags := ParseSection(doc, CoverQuery)
-	shortSummary, shortSummaryTags := ParseSection(doc, ShortSummaryQuery)
-	longSummary, longSummaryTags := ParseSection(doc, LongSummaryQuery)
-
-	chapterModel.Number = uint8(chapterNumber)
-
-	chapterModel.CoverPage = cover
-	chapterModel.ShortSummary = shortSummary
-	chapterModel.LongSummary = longSummary
-
-	var charTags []LocalTag
-	doc.Find(".CharTable a").Each(func(i int, s *goquery.Selection) {
-		var tag = new(LocalTag)
-		tag.Url, _ = s.Attr("href")
-		tag.Alias = s.Text()
-		charTags = append(charTags, *tag)
-	})
-
-	generalInfo := doc.Find("#mw-content-text > div > aside")
-
-	title := generalInfo.Find("[data-source=title]").Text()
-
-	chapterModel.Title = title
-
-	releaseDate := generalInfo.Find("[data-source=date2] > div").Text()
-	releaseDate = strings.Trim(releaseDate, "[ref]")
-	relDate, _ := time.Parse("January 2, 2006", releaseDate)
-
-	chapterModel.ReleaseDate = relDate
-
-	coverUrl, _ := generalInfo.Find("[data-source=image] > a").Attr("href")
-
-	chapterModel.CoverURL = coverUrl
-
-	db.Create(&chapterModel)
-
-	CreateTags(chapterModel, coverTags, "cover", db)
-	CreateTags(chapterModel, shortSummaryTags, "short", db)
-	CreateTags(chapterModel, longSummaryTags, "long", db)
-	CreateTags(chapterModel, charTags, "characters", db)
-
-	fmt.Println("Terminand el chapter", chapterNumber)
-}
-
-func CreateTags(chapter *Chapter, tags []LocalTag, section string, db *gorm.DB) {
-	for _, tag := range tags {
-		var tagModel = new(Tag)
-		tagModel.URL = tag.Url
-		db.FirstOrCreate(&tagModel, Tag{URL: tag.Url})
-
-		var aliasModel = new(Alias)
-		aliasModel.Name = tag.Alias
-		aliasModel.TagID = tagModel.ID
-		db.FirstOrCreate(&aliasModel, Alias{Name: tag.Alias, TagID: tagModel.ID})
-
-		var chapterTag = new(ChapterTags)
-		chapterTag.ChapterID = chapter.ID
-		chapterTag.TagID = tagModel.ID
-		chapterTag.Section = section
-
-		db.FirstOrCreate(&chapterTag, ChapterTags{ChapterID: chapter.ID, TagID: tagModel.ID, Section: section})
-	}
-}
-
-func ParseSection(doc *goquery.Document, query string) (string, []LocalTag) {
+func parseSection(doc *goquery.Document, query string) (text string, refs []Reference) {
 	node := doc.Find(query).Parent().Next()
-
-	var text string
-	var tags []LocalTag
 
 	for node.Is("p") {
 		text += node.Text()
 		node.Find("a").Each(func(i int, s *goquery.Selection) {
-			var tag = new(LocalTag)
-			tag.Url, _ = s.Attr("href")
-			tag.Alias = s.Text()
-			tags = append(tags, *tag)
+			var ref = new(Reference)
+			ref.Wiki, _ = s.Attr("href")
+			ref.Name = s.Text()
+			if ref.Wiki == "/wiki/Belly" {
+				ref.Name = "Belly"
+			}
+			if ref.Wiki == "/wiki/Belly#Other_Currencies" {
+				ref.Name = "Belly Other currencies"
+			}
+			refs = append(refs, *ref)
 		})
 
 		node = node.Next()
 	}
 
-	return text, tags
-}
+	text = strings.ReplaceAll(text, "\n", "")
+	text = html.EscapeString(text)
 
-func main() {
-	db, err := gorm.Open(mysql.Open("root:secret@tcp(localhost:3306)/op_api?parseTime=true"), &gorm.Config{})
-	if err != nil {
-		panic("failed to connect database")
+	if text == "" {
+		text = "Not Available"
 	}
 
-	err = db.SetupJoinTable(&Chapter{}, "Tags", &ChapterTags{})
-	if err != nil {
-		panic("Fail to set up join")
-	}
-
-	err = db.SetupJoinTable(&Tag{}, "Chapters", &ChapterTags{})
-	if err != nil {
-		panic("Fail to set up join")
-	}
-
-	db.AutoMigrate(&Chapter{})
-	db.AutoMigrate(&Tag{})
-	db.AutoMigrate(&Alias{})
-	db.AutoMigrate(&ChapterTags{})
-
-	for i := 1; i < 1008; i++ {
-		TestScrape(db, i)
-	}
+	return text, refs
 }
